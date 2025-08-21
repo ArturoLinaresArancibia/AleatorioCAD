@@ -11,17 +11,17 @@ from math import floor
 st.set_page_config(page_title="Control Alcohol y Drogas", layout="wide")
 
 # ========================= Parámetros de negocio (ajustables) =========================
-JORNADAS_DIA_PRIOR = {"4X3DIP01", "4X3DIE01"}  # para el cupo especial Lun–Jue (Día)
-FUNCION_OPERADOR = "OPERADOR MINA"            # coincidencia contiene (case-insensitive)
+JORNADAS_DIA_PRIOR = {"4X3DIP01", "4X3DIE01"}  # cupo especial Lun–Jue (Día)
+FUNCION_OPERADOR = "OPERADOR MINA"             # coincidencia contiene (case-insensitive)
 COL_GERENCIA_ORIG = "Texto Gerencia"
-COL_FUNCION_ORIG = "Denominación Función"
-COL_TURNO_ORIG   = "Regla p.plan h.tbjo."
-COL_JORNADA_ORIG = "Jornada"   # si no existe, el código detecta heurísticamente
+COL_FUNCION_ORIG  = "Denominación Función"
+COL_TURNO_ORIG    = "Regla p.plan h.tbjo."
+COL_JORNADA_ORIG  = "Jornada"  # si no existe, el código intenta detectar heurísticamente
 
 # Límites / espaciado
 MAX_VECES_ANO = 4
 PRIORIDAD_ESPACIADO_DIAS = [90, 60, 30, 0]  # se relaja si no alcanza cupo
-REINGRESO_NO_SHOW_DIAS = 60  # si no asistió en últimos N días, esa citación no cuenta
+REINGRESO_NO_SHOW_DIAS = 60  # si no asistió en últimos N días, reintegrar a la tómbola
 
 # =====================================================================================
 
@@ -51,16 +51,15 @@ def detect_col(df_norm, map_norm_to_orig, map_orig_to_norm, orig_name, heuristic
 
 def read_sheet(uploaded_file, sheet_like):
     xls = pd.ExcelFile(uploaded_file)
-    # aceptar nombre exacto o aproximado
     names = {s.lower(): s for s in xls.sheet_names}
     key = sheet_like.lower()
-    use = names.get(key, None)
+    use = names.get(key)
     if use is None:
-        # busca por comienzo
         for s in xls.sheet_names:
-            if s.lower().startswith(key[:5]): use = s; break
+            if s.lower().startswith(key[:5]):
+                use = s
+                break
         if use is None:
-            # primera hoja
             use = xls.sheet_names[0]
     df_raw = pd.read_excel(uploaded_file, sheet_name=use)
     return df_raw, use
@@ -101,7 +100,6 @@ def distribuir_proporcional(series_counts: pd.Series, total: int) -> dict:
             asigna[decs[i % len(decs)][0]] += 1
     for k in list(asigna.keys()):
         asigna[k] = min(asigna[k], d[k])
-    # redistribuye si falta
     faltan = total - sum(asigna.values())
     if faltan > 0:
         for k in sorted(d, key=lambda x: d[x]-asigna[x], reverse=True):
@@ -116,30 +114,35 @@ def distribuir_proporcional(series_counts: pd.Series, total: int) -> dict:
 def safe_contains(val, needle):
     return needle.lower() in str(val).lower()
 
-def filtrar_no_show_relaja(hist_df, asis_df, id_col="SURR", fecha_col="FECHA", asist_col="ASISTE"):
-    """Si alguien tiene registro 'NO' de asistencia reciente, ignoramos su última citación al evaluar tope/espaciado."""
-    if asis_df is None or asis_df.empty: 
-        return hist_df
-    df = hist_df.copy()
-    # Inferencia simple de claves
-    # buscamos columnas que parezcan ID (SAP/RUT) y asistencia/fecha
+def filtrar_no_show_relaja(hist_df, asis_df):
+    """
+    Si alguien tiene registro 'NO' de asistencia reciente, ignoramos su última citación
+    al evaluar tope/espaciado (reingresa a la tómbola).
+    """
+    if asis_df is None or asis_df.empty or hist_df is None or hist_df.empty:
+        return hist_df if hist_df is not None else pd.DataFrame()
+    dfh = hist_df.copy()
+    # Inferencia simple de claves en asistencia
     cols = {c.upper(): c for c in asis_df.columns}
     cand_id = next((cols[c] for c in cols if c in {"SAP","RUT","RUN","ID"}), None)
     cand_as = next((cols[c] for c in cols if "ASIST" in c or "PRESENT" in c), None)
     cand_fe = next((cols[c] for c in cols if "FECHA" in c), None)
-    if not all([cand_id, cand_as, cand_fe]): 
-        return df  # no podemos cruzar
+    if not all([cand_id, cand_as, cand_fe]):
+        return dfh
+    # Filtrar últimos N días
     recent = asis_df.copy()
     recent[cand_fe] = pd.to_datetime(recent[cand_fe], errors="coerce")
     cutoff = pd.Timestamp.today() - pd.Timedelta(days=REINGRESO_NO_SHOW_DIAS)
     recent = recent[recent[cand_fe] >= cutoff]
-    # valores negativos para no asistencia
     mask_no = recent[cand_as].astype(str).str.upper().isin(["NO","N","0","FALTA","ABSENT"])
     reingreso_ids = set(recent.loc[mask_no, cand_id].astype(str))
-    if "SURROGATE_ID" in df.columns:
-        df.loc[df["SURROGATE_ID"].astype(str).isin(reingreso_ids), ["FECHA"]] = None
-        df.loc[df["SURROGATE_ID"].astype(str).isin(reingreso_ids), ["N_CITACIONES_ANO"]] = 0
-    return df
+    if not reingreso_ids:
+        return dfh
+    # Si en historial hay esos IDs, les anulamos la fecha (para forzar reingreso)
+    if "SURROGATE_ID" in dfh.columns:
+        mask_hit = dfh["SURROGATE_ID"].astype(str).isin(reingreso_ids)
+        dfh.loc[mask_hit, "FECHA"] = pd.NaT
+    return dfh
 
 # ========================= UI =========================
 st.title("🧪 Control de Alcohol y Drogas")
@@ -153,7 +156,7 @@ with colY:
     jornada = st.selectbox("Jornada", options=["Día","Noche"], index=0)
 
 if not up:
-    st.info("Cargar Excel para continuar.")
+    st.info("Carga el Excel para continuar.")
     st.stop()
 
 # -------- leer DOTACIÓN --------
@@ -178,7 +181,6 @@ try:
         df_dot, map_n2o, map_o2n, COL_GERENCIA_ORIG,
         heuristics=[lambda c: "GEREN" in c]
     )
-    # jornada puede variar de nombre
     col_jorn, col_jorn_orig = detect_col(
         df_dot, map_n2o, map_o2n, COL_JORNADA_ORIG,
         heuristics=[lambda c: "JORN" in c or "CALENDAR" in c], required=False
@@ -221,8 +223,11 @@ else:
     hist = pd.DataFrame(columns=["SURROGATE_ID","FECHA","TURNO","TIMESTAMP","NOMBRE"])
 
 # Normalizar historial
-if not hist.empty and "FECHA" in hist.columns:
-    hist["FECHA"] = pd.to_datetime(hist["FECHA"], errors="coerce")
+if not hist.empty:
+    if "FECHA" in hist.columns:
+        hist["FECHA"] = pd.to_datetime(hist["FECHA"], errors="coerce")
+    if "SURROGATE_ID" in hist.columns:
+        hist["SURROGATE_ID"] = hist["SURROGATE_ID"].astype(str)
 
 # Si hay no-shows recientes, los reintegramos (ignorar su última FECHA/conteo)
 hist = filtrar_no_show_relaja(hist, df_asis)
@@ -231,33 +236,55 @@ hist = filtrar_no_show_relaja(hist, df_asis)
 today = pd.Timestamp(fecha_ctrl)
 year_ago = today - pd.Timedelta(days=365)
 
-# límites por año / espaciado
-def elegible_por_hist(id_series: pd.Series) -> pd.Series:
+# límites por año / espaciado — SIEMPRE devolver (eligibles_flag, days_since_last)
+def elegible_por_hist(id_series: pd.Series):
+    """
+    Devuelve SIEMPRE (eligibles_flag, days_since_last).
+    - eligibles_flag: Series booleana por ID (tope 4 en 365 días).
+    - days_since_last: días desde la última citación (99999 si nunca).
+    """
     ids = id_series.astype(str)
-    if hist.empty: 
-        return pd.Series(True, index=ids.index)
-    # cuenta en 365 días
-    h = hist[hist["SURROGATE_ID"].astype(str).isin(ids)]
+
+    # Sin historial o sin FECHA: todos elegibles, sin última citación
+    if hist is None or hist.empty or "FECHA" not in hist.columns:
+        eligibles = pd.Series(True, index=ids.index)
+        days_since = pd.Series(99999, index=ids.index)
+        return eligibles, days_since
+
+    # Asegurar FECHA como datetime
+    h = hist.copy()
+    h["FECHA"] = pd.to_datetime(h["FECHA"], errors="coerce")
+
+    # Ventana 365 días
     h_recent = h[h["FECHA"] >= year_ago]
-    counts = h_recent.groupby("SURROGATE_ID").size()
-    # última fecha
-    last_date = h.groupby("SURROGATE_ID")["FECHA"].max()
-    out = pd.Series(True, index=ids.index)
 
-    # aplica tope
-    mask_tope = ids.isin(counts[counts >= MAX_VECES_ANO].index)
-    out[mask_tope] = False
+    # Conteo por ID en 365 días
+    counts = h_recent.groupby(h_recent["SURROGATE_ID"].astype(str)).size() if not h_recent.empty else pd.Series(dtype=int)
 
-    # aplica espaciados por prioridad (se suaviza después si no alcanza cupo)
-    # guardamos días desde última
-    days_since = ids.map(lambda x: (today - last_date.get(x, pd.NaT)).days if pd.notna(last_date.get(x, pd.NaT)) else 99999)
-    return out, days_since
+    # Última fecha por ID
+    last_date = h.groupby(h["SURROGATE_ID"].astype(str))["FECHA"].max() if not h.empty else pd.Series(dtype="datetime64[ns]")
+
+    # Elegibles por tope
+    eligibles = pd.Series(True, index=ids.index)
+    if not counts.empty:
+        ids_tope = counts[counts >= MAX_VECES_ANO].index
+        eligibles[ids.isin(ids_tope)] = False
+
+    # Días desde última citación
+    def _days_since(x):
+        ld = last_date.get(x, pd.NaT) if isinstance(last_date, pd.Series) else pd.NaT
+        if pd.isna(ld):
+            return 99999
+        return (today - ld).days
+
+    days_since = ids.map(_days_since)
+    return eligibles, days_since
 
 eligibles_flag, days_since_last = elegible_por_hist(df_dot["SURROGATE_ID"])
 df_dot["ELIGIBLE_BASE"] = eligibles_flag.fillna(True)
 df_dot["DIAS_DESDE_ULT"] = days_since_last.fillna(99999)
 
-# Función de muestreo con criterio de espaciado
+# Muestreo con prioridad de espaciado
 def sample_with_spacing(pool: pd.DataFrame, n: int, prefer_days=PRIORIDAD_ESPACIADO_DIAS, seed=0) -> pd.DataFrame:
     if n <= 0 or pool.empty:
         return pool.head(0).copy()
@@ -267,7 +294,7 @@ def sample_with_spacing(pool: pd.DataFrame, n: int, prefer_days=PRIORIDAD_ESPACI
     used_idx = set()
     for thr in prefer_days:
         cand = pool[(pool["ELIGIBLE_BASE"]) & (pool["DIAS_DESDE_ULT"] >= thr) & (~pool.index.isin(used_idx))]
-        if cand.empty: 
+        if cand.empty:
             continue
         take_n = min(remaining, len(cand))
         take = cand.iloc[rng.permutation(len(cand))[:take_n]]
@@ -276,7 +303,6 @@ def sample_with_spacing(pool: pd.DataFrame, n: int, prefer_days=PRIORIDAD_ESPACI
         remaining -= take_n
         if remaining == 0:
             break
-    # si aún faltan, tomar de cualquiera elegible
     if remaining > 0:
         cand = pool[(pool["ELIGIBLE_BASE"]) & (~pool.index.isin(used_idx))]
         take_n = min(remaining, len(cand))
@@ -310,8 +336,8 @@ else:
 
 # 2) Pool operadores mina del turno objetivo
 pool_oper = pool_base[
-    pool_base[col_turno].astype(str) == str(turno_obj)
-    & pool_base[col_func].apply(lambda x: safe_contains(x, FUNCION_OPERADOR))
+    (pool_base[col_turno].astype(str) == str(turno_obj)) &
+    (pool_base[col_func].apply(lambda x: safe_contains(x, FUNCION_OPERADOR)))
 ].copy()
 
 # 3) Pool extras: todo elegible menos lo ya usado en 1) y 2)
@@ -373,13 +399,13 @@ st.download_button("⬇️ Descargar Excel de Control", excel_bytes,
                    file_name=f"control_AD_{fecha_txt}.xlsx",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-# Historial actualizado (en memoria)
+# Historial actualizado (en memoria para descarga)
 hist_update = pd.DataFrame({
     "SURROGATE_ID": resultado["SURROGATE_ID"].astype(str).tolist(),
     "FECHA": [fecha_txt] * len(resultado),
     "TURNO": resultado[col_turno].astype(str).tolist(),
     "TIMESTAMP": [datetime.now().strftime("%Y-%m-%d %H:%M:%S")] * len(resultado),
-    "NOMBRE": (df_dot[map_o2n.get("Nombre")] 
+    "NOMBRE": (df_dot[map_o2n.get("Nombre")]
                if map_o2n.get("Nombre") in df_dot.columns else pd.Series([""]*len(resultado))).reindex(resultado.index).tolist()
 })
 hist2 = pd.concat([hist, hist_update], ignore_index=True)
@@ -387,7 +413,8 @@ csv_hist = hist2.copy()
 csv_hist["FECHA"] = csv_hist["FECHA"].astype(str)
 
 csv_bytes = csv_hist.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-st.download_button("⬇️ Descargar Historial Actualizado (CSV)", csv_bytes, file_name="historial_actualizado.csv", mime="text/csv")
+st.download_button("⬇️ Descargar Historial Actualizado (CSV)", csv_bytes,
+                   file_name="historial_actualizado.csv", mime="text/csv")
 
 # Resumen por origen y por gerencia en extras
 with st.expander("📊 Resumen"):
@@ -396,9 +423,9 @@ with st.expander("📊 Resumen"):
     st.subheader("Por tipo de selección")
     st.dataframe(res_origen, use_container_width=True)
 
-    if not take3.empty:
-        st.subheader("Extras por gerencia (mantenida proporcionalidad)")
+    if 'take3' in locals() and not take3.empty:
+        st.subheader("Extras por gerencia (proporcionalidad)")
         df_g = take3.groupby(col_ger).size().rename("N").reset_index()
         st.dataframe(df_g, use_container_width=True)
 
-st.caption("Reglas aplicadas: cupos por día/jornada, tope 4 por año, preferencia ≥90 días desde última citación (relaja 60/30/0), reingreso por no-show reciente, extras asignados proporcionalmente por Gerencia.")
+st.caption("Reglas: cupos por día/jornada, tope 4 por año, preferencia ≥90 días (relaja 60/30/0), reingreso por no-show reciente, extras proporcionales por Gerencia.")
