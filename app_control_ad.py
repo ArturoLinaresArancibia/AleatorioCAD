@@ -3,7 +3,6 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from pathlib import Path
 from datetime import date, datetime
 import io, re
 from math import floor
@@ -11,23 +10,24 @@ from math import floor
 st.set_page_config(page_title="Control Alcohol y Drogas", layout="wide")
 
 # ========================= Parámetros de negocio =========================
-JORNADAS_DIA_PRIOR = {"4X3DIP01", "4X3DIE01"}   # cupo especial Lun–Jue (Día)
+JORNADAS_4X3_COD = {"4X3DIP01", "4X3DIE01"}     # vienen de la MISMA columna "Regla p.plan h.tbjo."
 FUNCION_OPERADOR = "OPERADOR MINA"              # match contains (case-insensitive)
 
 COL_GERENCIA_ORIG = "Texto Gerencia"
 COL_FUNCION_ORIG  = "Denominación Función"
-COL_TURNO_ORIG    = "Regla p.plan h.tbjo."
-COL_JORNADA_ORIG  = "Jornada"  # si no existe, se intenta detectar
+COL_REGLA_ORIG    = "Regla p.plan h.tbjo."      # ÚNICA columna para turno/jornada
 
 MAX_VECES_ANO = 4
 PRIORIDAD_ESPACIADO_DIAS = [90, 60, 30, 0]
 REINGRESO_NO_SHOW_DIAS = 60
 # =======================================================================
 
+# Columnas que mostraremos en el Excel final (quitamos Subgerencia y Departamento)
 REQ_COLS_ORIG = [
     "SAP","Nombre","Área pers.","Posición","Denominación Posición","Función","Denominación Función",
-    "Unidad org.","Denominación Organización","Texto Gerencia","Texto Subgerencia",
-    "Texto Superintendencia","Texto Departamento","Rol Unico Tributario","Regla p.plan h.tbjo."
+    "Unidad org.","Denominación Organización","Texto Gerencia",
+    "Texto Superintendencia",
+    "Rol Unico Tributario","Regla p.plan h.tbjo."
 ]
 
 # -------------------- utilidades --------------------
@@ -74,6 +74,7 @@ def construir_salida(sample, map_norm_to_orig, map_orig_to_norm, fecha_txt):
     req_norm = [c for c in req_norm if c in sample.columns and c is not None]
     salida = sample[req_norm].copy()
     salida.columns = [map_norm_to_orig[c] for c in salida.columns]
+    # columnas nuevas al final: métricas
     salida.insert(0, "Fecha aleatorio", fecha_txt)
     return salida
 
@@ -111,7 +112,15 @@ def distribuir_proporcional(series_counts: pd.Series, total: int) -> dict:
 def safe_contains(val, needle):
     return needle.lower() in str(val).lower()
 
+def parse_bool_asistencia(x: str) -> bool:
+    s = str(x).strip().upper()
+    return s in {"SI","S","1","ASISTE","PRESENTE","TRUE","T"}  # positivos comunes
+
 def filtrar_no_show_relaja(hist_df, asis_df):
+    """
+    Reintegra a la tómbola si hay NO-SHOW reciente en asistencia (últimos REINGRESO_NO_SHOW_DIAS):
+    en la práctica, anulamos FECHA en historial para ese ID (no cuenta para tope/espaciado).
+    """
     if asis_df is None or asis_df.empty or hist_df is None or hist_df.empty:
         return hist_df if hist_df is not None else pd.DataFrame()
     dfh = hist_df.copy()
@@ -125,7 +134,7 @@ def filtrar_no_show_relaja(hist_df, asis_df):
     recent[cand_fe] = pd.to_datetime(recent[cand_fe], errors="coerce")
     cutoff = pd.Timestamp.today() - pd.Timedelta(days=REINGRESO_NO_SHOW_DIAS)
     recent = recent[recent[cand_fe] >= cutoff]
-    mask_no = recent[cand_as].astype(str).str.upper().isin(["NO","N","0","FALTA","ABSENT"])
+    mask_no = ~recent[cand_as].apply(parse_bool_asistencia)
     reingreso_ids = set(recent.loc[mask_no, cand_id].astype(str))
     if not reingreso_ids:
         return dfh
@@ -156,27 +165,19 @@ except Exception as e:
     st.error(f"Error leyendo hoja DOTACION: {e}")
     st.stop()
 
-# columnas clave
+# columnas clave (todas desde dotación)
 try:
-    col_turno, col_turno_orig = detect_col(
-        df_dot, map_n2o, map_o2n, COL_TURNO_ORIG,
+    col_regla, col_regla_orig = detect_col(
+        df_dot, map_n2o, map_o2n, COL_REGLA_ORIG,
         heuristics=[lambda c: ("REGLA" in c and "PLAN" in c and "TBJO" in c)]
     )
-    col_func, col_func_orig = detect_col(
+    col_func,  col_func_orig  = detect_col(
         df_dot, map_n2o, map_o2n, COL_FUNCION_ORIG,
         heuristics=[lambda c: ("DENOMINACION" in c or "DENOMINACIÓN" in c) and "FUNC" in c]
     )
-    col_ger, col_ger_orig = detect_col(
+    col_ger,   col_ger_orig   = detect_col(
         df_dot, map_n2o, map_o2n, COL_GERENCIA_ORIG,
         heuristics=[lambda c: "GEREN" in c]
-    )
-    # jornada: detectar robusto (JORN, CALENDAR, TURNO-DIA/NOCHE)
-    col_jorn, col_jorn_orig = detect_col(
-        df_dot, map_n2o, map_o2n, COL_JORNADA_ORIG,
-        heuristics=[
-            lambda c: "JORN" in c or "CALENDAR" in c or ("TURNO" in c and ("DIA" in c or "NOCHE" in c))
-        ],
-        required=False
     )
 except Exception as e:
     st.error(str(e)); st.stop()
@@ -189,11 +190,11 @@ else:
     df_dot["SURROGATE_ID"] = df_dot.index.astype(str)
 
 # limpiar nulos básicos
-df_dot = df_dot[~df_dot[col_turno].isna()].copy()
+df_dot = df_dot[~df_dot[col_regla].isna()].copy()
 df_dot = df_dot[~df_dot[col_ger].isna()].copy()
 
-# turnos disponibles (para multi-selección)
-turnos_all = (df_dot[col_turno].astype(str).str.strip()
+# turnos disponibles (multi-selección desde la MISMA columna)
+turnos_all = (df_dot[col_regla].astype(str).str.strip()
               .replace("", np.nan).dropna().drop_duplicates().sort_values().tolist())
 turns_sel = st.multiselect("Selecciona uno o más turnos (Regla p.plan h.tbjo.)", options=turnos_all, default=turnos_all[:1])
 if not turns_sel:
@@ -224,6 +225,7 @@ if not hist.empty:
     if "SURROGATE_ID" in hist.columns:
         hist["SURROGATE_ID"] = hist["SURROGATE_ID"].astype(str)
 
+# Reingreso por no-show reciente
 hist = filtrar_no_show_relaja(hist, df_asis)
 
 # -------- elegibilidad por historial --------
@@ -253,8 +255,8 @@ def elegible_por_hist(id_series: pd.Series):
     return eligibles, days_since
 
 eligibles_flag, days_since_last = elegible_por_hist(df_dot["SURROGATE_ID"])
-df_dot["ELIGIBLE_BASE"] = eligibles_flag.fillna(True)
-df_dot["DIAS_DESDE_ULT"] = days_since_last.fillna(99999)
+df_dot["ELIGIBLE_BASE"]   = eligibles_flag.fillna(True)
+df_dot["DIAS_DESDE_ULT"]  = days_since_last.fillna(99999)
 
 def sample_with_spacing(pool: pd.DataFrame, n: int, prefer_days=PRIORIDAD_ESPACIADO_DIAS, seed=0) -> pd.DataFrame:
     if n <= 0 or pool.empty: return pool.head(0).copy()
@@ -278,30 +280,24 @@ def sample_with_spacing(pool: pd.DataFrame, n: int, prefer_days=PRIORIDAD_ESPACI
 # -------- cupos por día/jornada --------
 dow = today.weekday()  # 0=lun ... 6=dom
 if jornada == "Día":
-    cupos = {"JORNADAS_DIA_PRIOR": 4 if dow <= 3 else 0, "OPERADORES_MINA": 4, "EXTRAS": 6}
+    cupos = {"JORNADAS_4X3": 4 if dow <= 3 else 0, "OPERADORES_MINA": 4, "EXTRAS": 6}
 else:
-    cupos = {"JORNADAS_DIA_PRIOR": 0, "OPERADORES_MINA": 4, "EXTRAS": 2}
+    cupos = {"JORNADAS_4X3": 0, "OPERADORES_MINA": 4, "EXTRAS": 2}
 
 st.subheader("Cupos del día")
 st.write(cupos)
 
-# -------- pools (todos restringidos a los turnos seleccionados cuando corresponde) --------
+# -------- pools --------
 pool_base = df_dot.copy()
 
-# 1) Jornadas 4x3 (solo Lun–Jue Día). Los tomamos del MISMO(os) turno(s) seleccionado(s).
-if col_jorn is not None and cupos["JORNADAS_DIA_PRIOR"] > 0:
-    # normalizamos valores de jornada
-    jornadas_norm = df_dot[col_jorn].astype(str).str.upper().str.replace(r"\s+", "", regex=True)
-    mask_4x3 = jornadas_norm.isin({j.replace(" ", "").upper() for j in JORNADAS_DIA_PRIOR})
-    pool_jorn = pool_base[
-        mask_4x3 & pool_base[col_turno].astype(str).isin([str(t) for t in turns_sel])
-    ].copy()
-else:
-    pool_jorn = pool_base.head(0).copy()
+# 1) 4x3 (Lun–Jue Día), desde la MISMA columna "Regla p.plan h.tbjo.", sin depender de turnos elegidos
+reglas_norm = df_dot[col_regla].astype(str).str.upper().str.replace(r"\s+", "", regex=True)
+pool_4x3 = pool_base[reglas_norm.isin({j.replace(" ", "").upper() for j in JORNADAS_4X3_COD})].copy() \
+           if cupos["JORNADAS_4X3"] > 0 else pool_base.head(0).copy()
 
 # 2) Operadores Mina de los turnos seleccionados
 pool_oper = pool_base[
-    (pool_base[col_turno].astype(str).isin([str(t) for t in turns_sel])) &
+    (pool_base[col_regla].astype(str).isin([str(t) for t in turns_sel])) &
     (pool_base[col_func].apply(lambda x: safe_contains(x, FUNCION_OPERADOR)))
 ].copy()
 
@@ -313,14 +309,13 @@ seed = int(today.strftime("%Y%m%d"))
 selected_parts = []
 warnings = []
 
-# Selección 1: Jornadas 4x3 (mismo turno)
-take1 = sample_with_spacing(pool_jorn, cupos["JORNADAS_DIA_PRIOR"], seed=seed+1)
+# Selección 1: 4x3
+take1 = sample_with_spacing(pool_4x3, cupos["JORNADAS_4X3"], seed=seed+1)
 selected_parts.append(take1)
 used = set(take1.index)
-if cupos["JORNADAS_DIA_PRIOR"] > 0 and len(take1) < cupos["JORNADAS_DIA_PRIOR"]:
-    warnings.append(f"Jornadas 4x3: requeridos {cupos['JORNADAS_DIA_PRIOR']}, disponibles {len(take1)} "
-                    f"(en turnos {', '.join(map(str, turns_sel))}). "
-                    f"Verifica que exista la columna de Jornada y que los códigos coincidan (4X3DIP01/4X3DIE01).")
+if cupos["JORNADAS_4X3"] > 0 and len(take1) < cupos["JORNADAS_4X3"]:
+    warnings.append(f"4x3: requeridos {cupos['JORNADAS_4X3']}, disponibles {len(take1)} "
+                    f"(valores {', '.join(sorted(JORNADAS_4X3_COD))} en '{COL_REGLA_ORIG}').")
 
 # Selección 2: Operadores Mina (mismo turno)
 pool_oper2 = exclude_taken(pool_oper, used)
@@ -335,7 +330,7 @@ if len(take2) < cupos["OPERADORES_MINA"]:
 pool_rest = exclude_taken(pool_base, used)
 pool_rest = pool_rest[
     (pool_rest["ELIGIBLE_BASE"]) &
-    (pool_rest[col_turno].astype(str).isin([str(t) for t in turns_sel]))
+    (pool_rest[col_regla].astype(str).isin([str(t) for t in turns_sel]))
 ].copy()
 
 if cupos["EXTRAS"] > 0 and not pool_rest.empty:
@@ -359,13 +354,57 @@ resultado = pd.concat(selected_parts, ignore_index=False) if selected_parts else
 resultado = resultado.drop_duplicates(subset=["SURROGATE_ID"])
 
 resultado["SELECCION"] = ""
-resultado.loc[resultado.index.isin(take1.index), "SELECCION"] += "JORNADA;"
+resultado.loc[resultado.index.isin(take1.index), "SELECCION"] += "4X3;"
 resultado.loc[resultado.index.isin(take2.index), "SELECCION"] += "OPERADOR;"
 resultado.loc[resultado.index.isin(take3.index), "SELECCION"] += "EXTRA;"
+
+# ---------- métricas (12m): citaciones, asistencias, última citación ----------
+def build_metrics(df_ids: pd.Series):
+    ids = df_ids.astype(str)
+    # citaciones 12m y última citación desde historial
+    if hist is None or hist.empty or "FECHA" not in hist.columns:
+        cit_12m = pd.Series(0, index=ids.index)
+        last_cit = pd.Series(pd.NaT, index=ids.index, dtype="datetime64[ns]")
+    else:
+        h = hist.copy()
+        h["FECHA"] = pd.to_datetime(h["FECHA"], errors="coerce")
+        h12 = h[h["FECHA"] >= year_ago]
+        cnt = h12.groupby(h12["SURROGATE_ID"].astype(str)).size()
+        last = h.groupby(h["SURROGATE_ID"].astype(str))["FECHA"].max()
+        cit_12m = ids.map(lambda x: int(cnt.get(x, 0)))
+        last_cit = ids.map(lambda x: last.get(x, pd.NaT))
+    # asistencias 12m desde hoja asistencia
+    if df_asis is None or df_asis.empty:
+        asis_12m = pd.Series(0, index=ids.index)
+    else:
+        cols = {c.upper(): c for c in df_asis.columns}
+        cand_id = next((cols[c] for c in cols if c in {"SAP","RUT","RUN","ID"}), None)
+        cand_as = next((cols[c] for c in cols if "ASIST" in c or "PRESENT" in c), None)
+        cand_fe = next((cols[c] for c in cols if "FECHA" in c), None)
+        if all([cand_id, cand_as, cand_fe]):
+            a = df_asis.copy()
+            a[cand_fe] = pd.to_datetime(a[cand_fe], errors="coerce")
+            a = a[a[cand_fe] >= year_ago]
+            a["OK"] = a[cand_as].apply(parse_bool_asistencia)
+            grp = a[a["OK"]].groupby(a[cand_id].astype(str)).size()
+            asis_12m = ids.map(lambda x: int(grp.get(x, 0)))
+        else:
+            asis_12m = pd.Series(0, index=ids.index)
+    return cit_12m, asis_12m, last_cit
+
+cit_12m, asis_12m, last_cit = build_metrics(resultado["SURROGATE_ID"])
+resultado["Citaciones (últ. 12m)"] = cit_12m.values
+resultado["Asistencias (últ. 12m)"] = asis_12m.values
+resultado["Última citación"] = pd.to_datetime(last_cit).dt.date
 
 # -------- mostrar --------
 fecha_txt = today.strftime("%Y-%m-%d")
 salida = construir_salida(resultado, map_n2o, map_o2n, fecha_txt)
+
+# Añadimos las métricas también al DataFrame de salida (al final)
+salida["Citaciones (últ. 12m)"] = resultado["Citaciones (últ. 12m)"].values
+salida["Asistencias (últ. 12m)"] = resultado["Asistencias (últ. 12m)"].values
+salida["Última citación"] = resultado["Última citación"].values
 
 st.success(f"Seleccionados: {len(salida)}  |  Turnos elegidos: {', '.join(map(str, turns_sel))}")
 if warnings:
@@ -379,14 +418,16 @@ st.download_button("⬇️ Descargar Excel de Control", excel_bytes,
                    file_name=f"control_AD_{fecha_txt}.xlsx",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-# historial actualizado
+# historial actualizado para descarga
 hist_update = pd.DataFrame({
     "SURROGATE_ID": resultado["SURROGATE_ID"].astype(str).tolist(),
     "FECHA": [fecha_txt]*len(resultado),
-    "TURNO": resultado[col_turno].astype(str).tolist(),
+    "TURNO": resultado[col_regla].astype(str).tolist(),
     "TIMESTAMP": [datetime.now().strftime("%Y-%m-%d %H:%M:%S")]*len(resultado),
-    "NOMBRE": (df_dot[map_o2n.get("Nombre")]
-               if map_o2n.get("Nombre") in df_dot.columns else pd.Series([""]*len(resultado))).reindex(resultado.index).tolist()
+    "NOMBRE": (
+        df_dot[map_o2n.get("Nombre")]
+        if map_o2n.get("Nombre") in df_dot.columns else pd.Series([""]*len(resultado))
+    ).reindex(resultado.index).tolist()
 })
 hist2 = pd.concat([hist, hist_update], ignore_index=True)
 csv_bytes = hist2.assign(FECHA=hist2["FECHA"].astype(str)).to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
@@ -404,4 +445,4 @@ with st.expander("📊 Resumen"):
         st.subheader("Extras por Gerencia (mismo turno)")
         st.dataframe(take3.groupby(col_ger).size().rename("N").reset_index(), use_container_width=True)
 
-st.caption("Reglas: Lun–Jue Día incluye 4 de jornadas 4X3 del mismo turno, Operadores Mina del/los turnos seleccionados, extras del mismo turno con proporcionalidad por Gerencia, tope 4/año, preferencia ≥90 días (relaja 60/30/0) y reingreso por no‑show.")
+st.caption("Reglas: 4x3 (Lun–Jue, Día) desde la misma columna de Regla; Operadores Mina y Extras del/los turno(s) seleccionados; tope 4/año y preferencia ≥90 días (relaja 60/30/0); reingreso por no‑show; métricas 12m incluidas.")
