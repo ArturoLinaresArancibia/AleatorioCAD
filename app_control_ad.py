@@ -11,8 +11,8 @@ from math import floor
 st.set_page_config(page_title="Control Alcohol y Drogas", layout="wide")
 
 # ========================= Parámetros de negocio =========================
-JORNADAS_DIA_PRIOR = {"4X3DIP01", "4X3DIE01"}  # cupo especial Lun–Jue (Día)
-FUNCION_OPERADOR = "OPERADOR MINA"             # match contains (case-insensitive)
+JORNADAS_DIA_PRIOR = {"4X3DIP01", "4X3DIE01"}   # cupo especial Lun–Jue (Día)
+FUNCION_OPERADOR = "OPERADOR MINA"              # match contains (case-insensitive)
 
 COL_GERENCIA_ORIG = "Texto Gerencia"
 COL_FUNCION_ORIG  = "Denominación Función"
@@ -170,9 +170,13 @@ try:
         df_dot, map_n2o, map_o2n, COL_GERENCIA_ORIG,
         heuristics=[lambda c: "GEREN" in c]
     )
+    # jornada: detectar robusto (JORN, CALENDAR, TURNO-DIA/NOCHE)
     col_jorn, col_jorn_orig = detect_col(
         df_dot, map_n2o, map_o2n, COL_JORNADA_ORIG,
-        heuristics=[lambda c: "JORN" in c or "CALENDAR" in c], required=False
+        heuristics=[
+            lambda c: "JORN" in c or "CALENDAR" in c or ("TURNO" in c and ("DIA" in c or "NOCHE" in c))
+        ],
+        required=False
     )
 except Exception as e:
     st.error(str(e)); st.stop()
@@ -281,12 +285,17 @@ else:
 st.subheader("Cupos del día")
 st.write(cupos)
 
-# -------- pools --------
+# -------- pools (todos restringidos a los turnos seleccionados cuando corresponde) --------
 pool_base = df_dot.copy()
 
-# 1) Jornadas 4x3 (solo Lun–Jue Día). NO se filtra por turno (pediste que “también incluya 4x3”).
+# 1) Jornadas 4x3 (solo Lun–Jue Día). Los tomamos del MISMO(os) turno(s) seleccionado(s).
 if col_jorn is not None and cupos["JORNADAS_DIA_PRIOR"] > 0:
-    pool_jorn = pool_base[pool_base[col_jorn].astype(str).str.upper().isin(JORNADAS_DIA_PRIOR)].copy()
+    # normalizamos valores de jornada
+    jornadas_norm = df_dot[col_jorn].astype(str).str.upper().str.replace(r"\s+", "", regex=True)
+    mask_4x3 = jornadas_norm.isin({j.replace(" ", "").upper() for j in JORNADAS_DIA_PRIOR})
+    pool_jorn = pool_base[
+        mask_4x3 & pool_base[col_turno].astype(str).isin([str(t) for t in turns_sel])
+    ].copy()
 else:
     pool_jorn = pool_base.head(0).copy()
 
@@ -296,7 +305,7 @@ pool_oper = pool_base[
     (pool_base[col_func].apply(lambda x: safe_contains(x, FUNCION_OPERADOR)))
 ].copy()
 
-# 3) Extras: resto elegible
+# 3) Extras: MISMO(os) turno(s) seleccionados, excluyendo ya tomados y solo elegibles
 def exclude_taken(df_all, taken_idx):
     return df_all[~df_all.index.isin(taken_idx)].copy()
 
@@ -304,14 +313,16 @@ seed = int(today.strftime("%Y%m%d"))
 selected_parts = []
 warnings = []
 
-# Selección 1: Jornadas 4x3
+# Selección 1: Jornadas 4x3 (mismo turno)
 take1 = sample_with_spacing(pool_jorn, cupos["JORNADAS_DIA_PRIOR"], seed=seed+1)
 selected_parts.append(take1)
 used = set(take1.index)
-if len(take1) < cupos["JORNADAS_DIA_PRIOR"]:
-    warnings.append(f"Jornadas 4x3: requeridos {cupos['JORNADAS_DIA_PRIOR']}, disponibles {len(take1)}.")
+if cupos["JORNADAS_DIA_PRIOR"] > 0 and len(take1) < cupos["JORNADAS_DIA_PRIOR"]:
+    warnings.append(f"Jornadas 4x3: requeridos {cupos['JORNADAS_DIA_PRIOR']}, disponibles {len(take1)} "
+                    f"(en turnos {', '.join(map(str, turns_sel))}). "
+                    f"Verifica que exista la columna de Jornada y que los códigos coincidan (4X3DIP01/4X3DIE01).")
 
-# Selección 2: Operadores Mina de turnos seleccionados
+# Selección 2: Operadores Mina (mismo turno)
 pool_oper2 = exclude_taken(pool_oper, used)
 take2 = sample_with_spacing(pool_oper2, cupos["OPERADORES_MINA"], seed=seed+2)
 selected_parts.append(take2)
@@ -320,9 +331,13 @@ if len(take2) < cupos["OPERADORES_MINA"]:
     warnings.append(f"Operadores Mina: requeridos {cupos['OPERADORES_MINA']}, disponibles {len(take2)} "
                     f"(en turnos {', '.join(map(str, turns_sel))}).")
 
-# Selección 3: Extras proporcionales por Gerencia
+# Selección 3: Extras (mismo turno) con proporcionalidad por Gerencia
 pool_rest = exclude_taken(pool_base, used)
-pool_rest = pool_rest[pool_rest["ELIGIBLE_BASE"]].copy()
+pool_rest = pool_rest[
+    (pool_rest["ELIGIBLE_BASE"]) &
+    (pool_rest[col_turno].astype(str).isin([str(t) for t in turns_sel]))
+].copy()
+
 if cupos["EXTRAS"] > 0 and not pool_rest.empty:
     by_ger = pool_rest.groupby(col_ger).size()
     asignas = distribuir_proporcional(by_ger, cupos["EXTRAS"])
@@ -335,7 +350,7 @@ if cupos["EXTRAS"] > 0 and not pool_rest.empty:
     take3 = pd.concat(parts_extra) if parts_extra else pool_rest.head(0).copy()
     selected_parts.append(take3)
     if len(take3) < cupos["EXTRAS"]:
-        warnings.append(f"Extras: requeridos {cupos['EXTRAS']}, disponibles {len(take3)} (tras elegibilidad e historial).")
+        warnings.append(f"Extras (mismo turno): requeridos {cupos['EXTRAS']}, disponibles {len(take3)}.")
 else:
     take3 = pool_rest.head(0).copy()
 
@@ -386,7 +401,7 @@ with st.expander("📊 Resumen"):
     st.dataframe(res_origen, use_container_width=True)
 
     if 'take3' in locals() and not take3.empty:
-        st.subheader("Extras por Gerencia (proporcionalidad)")
+        st.subheader("Extras por Gerencia (mismo turno)")
         st.dataframe(take3.groupby(col_ger).size().rename("N").reset_index(), use_container_width=True)
 
-st.caption("Reglas: Lun–Jue Día incluye 4 con jornadas 4X3, Operadores Mina solo de turnos seleccionados, extras proporcionales por Gerencia, tope 4/año y preferencia ≥90 días (relaja 60/30/0), reingreso por no‑show.")
+st.caption("Reglas: Lun–Jue Día incluye 4 de jornadas 4X3 del mismo turno, Operadores Mina del/los turnos seleccionados, extras del mismo turno con proporcionalidad por Gerencia, tope 4/año, preferencia ≥90 días (relaja 60/30/0) y reingreso por no‑show.")
